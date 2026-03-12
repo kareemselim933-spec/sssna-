@@ -508,7 +508,7 @@ class QueueBot(discord.Client):
         log(f"✅ Logged in as {self.user} ({self.user.id})")
         log(f"👀 Watching channel ID: {WATCH_CHANNEL_ID}")
         send_telegram(
-            f"🤖 <b>Queue bot is online! V2! </b>\n"
+            f"🤖 <b>Queue bot is online!</b>\n"
             f"Watching SMP Tierlist queue channel.\n"
             f"Will auto-join and notify you."
         )
