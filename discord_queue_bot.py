@@ -21,9 +21,8 @@ SETUP:
 USAGE:
   1. Fill in your .env file
   2. python discord_queue_bot.py
-
-⚠️  WARNING: This uses a selfbot (user account token).
-    This violates Discord's ToS. Use at your own risk.
+WARNING: This uses a selfbot (user account token).
+This violates Discord's ToS. Use at your own risk.
 """
 
 import re
