@@ -30,8 +30,6 @@ DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN", "YOUR_USER_TOKEN_HERE")
 WATCH_CHANNEL_ID   = int(os.getenv("WATCH_CHANNEL_ID", "0"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
-
-# Your Discord user ID — used to find your position in the queue
 YOUR_USER_ID       = int(os.getenv("YOUR_USER_ID", "962048694293762108"))
 
 # Keywords that indicate a queue message (case-insensitive)
@@ -94,29 +92,45 @@ def find_join_button(message: discord.Message):
     return None
 
 
-def find_queue_position(message: discord.Message, user_id: int) -> int | None:
+def user_is_mentioned(message: discord.Message, user_id: int) -> bool:
     """
-    Scan the message content/embeds for a list of user mentions and return
-    the 1-based position of user_id, or None if not found.
-    Also handles plain text patterns like '1. <@123>' or '1) username'.
+    Check if the user ID appears anywhere in the message.
+    Handles both <@USER_ID> and <@!USER_ID> formats.
     """
-    # Collect all text from the message
     full_text = message.content
     for embed in message.embeds:
         full_text += f"\n{embed.title or ''}\n{embed.description or ''}"
         for field in embed.fields:
             full_text += f"\n{field.value}"
 
-    # Look for the user mention (<@USER_ID>) and find its line number
+    uid = str(user_id)
+    # Match <@962...> and <@!962...>
+    return bool(re.search(rf"<@!?{uid}>", full_text))
+
+
+def find_queue_position(message: discord.Message, user_id: int) -> int | None:
+    """
+    Scan message for a numbered list containing the user's mention.
+    Handles formats like:
+      1. <@!962048694293762108>
+      2. <@962048694293762108>
+    Returns the position number or None.
+    """
+    full_text = message.content
+    for embed in message.embeds:
+        full_text += f"\n{embed.title or ''}\n{embed.description or ''}"
+        for field in embed.fields:
+            full_text += f"\n{field.value}"
+
+    uid = str(user_id)
     lines = full_text.split("\n")
-    for i, line in enumerate(lines, start=1):
-        if str(user_id) in line:
-            # Try to extract an explicit number from the line first
-            match = re.search(r"^(\d+)[.):\s]", line.strip())
+    for line in lines:
+        # Check if this line contains the user's mention
+        if re.search(rf"<@!?{uid}>", line):
+            # Extract the leading number from the line e.g. "5. <@!123>"
+            match = re.search(r"(\d+)[.):\s]", line.strip())
             if match:
                 return int(match.group(1))
-            # Otherwise use line index as position (rough estimate)
-            return i
     return None
 
 
@@ -127,12 +141,13 @@ class QueueBot(discord.Client):
     def __init__(self):
         super().__init__()
         # States:
-        #   "waiting"  — no queue active, watching for one
-        #   "full"     — tried to join but queue was full, waiting for reset
-        #   "joined"   — successfully joined the queue
-        self.state        = "waiting"
-        self.queue_msg_id = None
-        self.last_position = None  # track last known position to avoid duplicate alerts
+        #   "waiting"  — watching for queue to open
+        #   "full"     — queue was full, waiting for reset
+        #   "joined"   — successfully in the queue
+        self.state         = "waiting"
+        self.queue_msg_id  = None
+        self.last_position = None
+        self._clicking     = False  # lock to prevent double-clicks
 
     async def on_ready(self):
         log(f"✅ Logged in as {self.user} ({self.user.id})")
@@ -148,7 +163,7 @@ class QueueBot(discord.Client):
         if message.channel.id != WATCH_CHANNEL_ID:
             return
 
-        # Detect the "queue is full" ephemeral reply sent to us after clicking
+        # Detect "queue is full" ephemeral reply after a failed click
         if self._is_full_response(message):
             if self.state != "full":
                 log("🚫 Got 'queue is full' response — stopping until queue resets.")
@@ -157,14 +172,37 @@ class QueueBot(discord.Client):
                     "Waiting for it to reset automatically."
                 )
                 self.state = "full"
+                self._clicking = False
             return
 
         await self._process(message, is_edit=False)
 
-    # ── Edited message (queue resets / reopens often via edits) ─────────────
+    # ── Edited message ───────────────────────────────────────────────────────
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if after.channel.id != WATCH_CHANNEL_ID:
             return
+
+        # ── KEY FEATURE: detect when our user ID appears in the queue list ──
+        # This fires when the queue message is edited and now includes our mention
+        if self.state == "waiting" and user_is_mentioned(after, YOUR_USER_ID):
+            position = find_queue_position(after, YOUR_USER_ID)
+            if position and position != self.last_position:
+                self.last_position = position
+                log(f"📊 Detected in queue at position #{position}")
+                send_telegram(f"📊 <b>You are in the queue!</b>\nPosition: <b>#{position}</b>")
+                self.state = "joined"
+                self.queue_msg_id = after.id
+            return
+
+        # If already joined, track position changes
+        if self.state == "joined" and user_is_mentioned(after, YOUR_USER_ID):
+            position = find_queue_position(after, YOUR_USER_ID)
+            if position and position != self.last_position:
+                self.last_position = position
+                log(f"📊 Position updated: #{position}")
+                send_telegram(f"📊 <b>Queue position update:</b> #{position}")
+            return
+
         await self._process(after, is_edit=True)
 
     # ── Message deleted ──────────────────────────────────────────────────────
@@ -172,19 +210,19 @@ class QueueBot(discord.Client):
         if message.channel.id != WATCH_CHANNEL_ID:
             return
         if message.id == self.queue_msg_id:
-            log("🗑️  Queue message deleted — resetting to waiting.")
+            log("🗑️  Queue message deleted — resetting.")
             await self._reset()
 
-    # ── Reaction added (queue bots often use reactions to signal open/reset) ─
+    # ── Reaction added ───────────────────────────────────────────────────────
     async def on_reaction_add(self, reaction: discord.Reaction, user):
         if reaction.message.channel.id != WATCH_CHANNEL_ID:
             return
         if self.state == "full":
-            log(f"🔔 Reaction detected on queue channel — checking if queue reopened.")
+            log("🔔 Reaction on queue channel — checking if reopened.")
             await self._process(reaction.message, is_edit=True)
 
     def _is_full_response(self, message: discord.Message) -> bool:
-        """Detect the ephemeral 'queue is full' message sent after a failed click."""
+        """Detect the ephemeral 'queue is full' message after a failed click."""
         text = message.content.lower()
         for embed in message.embeds:
             text += f" {embed.title or ''} {embed.description or ''}".lower()
@@ -199,9 +237,8 @@ class QueueBot(discord.Client):
     # ── Core logic ───────────────────────────────────────────────────────────
     async def _process(self, message: discord.Message, is_edit: bool):
 
-        # Already in queue — just track position updates
+        # Already joined — nothing to do here (handled in on_message_edit)
         if self.state == "joined":
-            await self._check_position(message)
             return
 
         # Not a queue message — ignore
@@ -212,7 +249,7 @@ class QueueBot(discord.Client):
 
         btn = find_join_button(message)
 
-        # ── Queue was full — check if it has reopened ────────────────────────
+        # ── Queue was full — check if reopened ───────────────────────────────
         if self.state == "full":
             if btn and not btn.disabled:
                 log("🔄 Queue reopened! Trying to join...")
@@ -220,7 +257,7 @@ class QueueBot(discord.Client):
                 self.state = "waiting"
                 # fall through to attempt join
             else:
-                log("⏸️  Queue still full or no active button. Continuing to wait.")
+                log("⏸️  Still full or no active button. Waiting.")
                 return
 
         # ── Waiting — try to join ────────────────────────────────────────────
@@ -230,7 +267,7 @@ class QueueBot(discord.Client):
                 return
 
             if btn.disabled:
-                log("🚫 Join button is disabled — queue is full (20/20). Waiting for reset.")
+                log("🚫 Button disabled — queue full. Waiting for reset.")
                 send_telegram(
                     "🚫 <b>Queue is full (20/20)</b>\n"
                     "Waiting for it to reset automatically."
@@ -239,26 +276,32 @@ class QueueBot(discord.Client):
                 self.queue_msg_id = message.id
                 return
 
-            # Button is active — try to click it
             await self._click_join(message, btn)
 
     async def _click_join(self, message: discord.Message, button):
-        """Attempt to click the Join Queue button."""
+        """Attempt to click the Join Queue button — with lock to prevent double clicks."""
+        if self._clicking:
+            log("⏳ Already clicking, skipping duplicate.")
+            return
+
+        self._clicking = True
         log("🖱️  Clicking Join Queue...")
         try:
             await button.click()
-            self.state = "joined"
+            # Don't mark as joined yet — wait for the queue message to be edited
+            # with our user ID in it (handled in on_message_edit)
+            log("✅ Click sent! Waiting for queue message to confirm position...")
             self.queue_msg_id = message.id
-            log("✅ Successfully joined the queue!")
-            position = find_queue_position(message, YOUR_USER_ID)
-            pos_text = f"#{position}" if position else "checking..."
-            self.last_position = position
-            send_telegram(
-                f"✅ <b>Joined the queue!</b>\n"
-                f"Your position: <b>{pos_text}</b>\n"
-                f"Server: SMP Tierlist\n"
-                f"Channel: #{message.channel.name}"
-            )
+            # Give it 5 seconds, if no confirmation assume joined without position
+            await asyncio.sleep(5)
+            if self.state != "joined":
+                self.state = "joined"
+                send_telegram(
+                    f"✅ <b>Joined the queue!</b>\n"
+                    f"Position: <b>checking...</b>\n"
+                    f"Server: SMP Tierlist\n"
+                    f"Channel: #{message.channel.name}"
+                )
 
         except discord.errors.Forbidden:
             log("🚫 Forbidden — queue is full or no permission.")
@@ -280,24 +323,19 @@ class QueueBot(discord.Client):
                 self.state = "full"
                 self.queue_msg_id = message.id
             else:
-                log(f"❌ Unexpected error clicking button: {e}")
+                log(f"❌ Unexpected error: {e}")
                 send_telegram(f"❌ <b>Error clicking Join Queue:</b>\n{e}")
-
-    async def _check_position(self, message: discord.Message):
-        """Check if user's queue position is in the message and notify if changed."""
-        position = find_queue_position(message, YOUR_USER_ID)
-        if position is not None and position != self.last_position:
-            self.last_position = position
-            log(f"📊 Queue position updated: #{position}")
-            send_telegram(f"📊 <b>Your queue position: #{position}</b>")
+        finally:
+            self._clicking = False
 
     async def _reset(self):
-        """Reset state when queue message is deleted (queue ended)."""
+        """Reset state when queue ends."""
         old_state = self.state
         self.state = "waiting"
         self.queue_msg_id = None
         self.last_position = None
-        log(f"🔁 State reset to waiting (was: {old_state})")
+        self._clicking = False
+        log(f"🔁 Reset to waiting (was: {old_state})")
         if old_state != "waiting":
             send_telegram("🏁 <b>Queue ended.</b> Watching for the next one.")
 
