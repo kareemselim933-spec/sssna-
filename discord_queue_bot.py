@@ -2,7 +2,7 @@
 Discord Queue Auto-Joiner + Telegram Notifier
 =============================================
 Watches a Discord channel for queue messages, auto-clicks Join Queue.
-If the queue is full (max 20), it stops and waits for the queue to reset.
+If the queue is full (max 20), it stops and waits for the queue to reset
  
 SETUP:
   pip install discord.py-self requests python-dotenv
